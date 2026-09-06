@@ -4,7 +4,20 @@ COMPOSE := docker compose
 SERVICE := mysql
 
 ENV_FILE := .env
-MYSQL_DATABASE ?= training
+SCRIPT_DIR := /bootcamp/scripts/dimensional_data_modeling
+
+# wait-db polls this many times, sleeping WAIT_INTERVAL seconds between tries.
+WAIT_RETRIES := 60
+WAIT_INTERVAL := 2
+
+DC := $(COMPOSE) --env-file $(ENV_FILE)
+
+# Run mysql in the container as MYSQL_USER, with $(1) appended (an -e query or
+# a < redirect). MYSQL_PWD keeps the password off the command line, which mysql
+# otherwise warns about on every invocation.
+mysql_run = $(DC) exec -T $(SERVICE) sh -c 'MYSQL_PWD="$$MYSQL_PASSWORD" mysql -u"$$MYSQL_USER" "$$MYSQL_DATABASE" $(1)'
+
+.DEFAULT_GOAL := help
 
 .PHONY: help env-example config up start wait-db stop down restart ps logs logs-follow mysql mysql-root load-players run-pipeline reload-players reset-db python clean-pyc
 
@@ -35,51 +48,65 @@ env-example:
 	@test -f $(ENV_FILE) || cp .env.example $(ENV_FILE)
 
 config: env-example
-	$(COMPOSE) --env-file $(ENV_FILE) config
+	$(DC) config
 
 up: env-example
-	$(COMPOSE) --env-file $(ENV_FILE) up -d
+	$(DC) up -d
 
 start: up
 
+# The retry loop runs on the host: `docker compose exec` fails outright while
+# the container is still starting, so a loop inside the container never gets a
+# chance to wait. `mysql -e 'SELECT 1'` is used instead of `mysqladmin ping`,
+# which exits 0 even when the server rejects the credentials.
 wait-db: up
-	$(COMPOSE) --env-file $(ENV_FILE) exec -T $(SERVICE) sh -lc 'until mysqladmin ping -h127.0.0.1 -u"$$MYSQL_USER" -p"$$MYSQL_PASSWORD" --silent; do sleep 2; done'
+	@printf 'Waiting for MySQL '
+	@i=0; \
+	until $(call mysql_run,-e "SELECT 1") >/dev/null 2>&1; do \
+		i=$$((i + 1)); \
+		if [ $$i -ge $(WAIT_RETRIES) ]; then \
+			printf ' timed out after %ss\n' $$((i * $(WAIT_INTERVAL))) >&2; \
+			exit 1; \
+		fi; \
+		printf '.'; \
+		sleep $(WAIT_INTERVAL); \
+	done; \
+	printf ' ready\n'
 
-stop:
-	$(COMPOSE) --env-file $(ENV_FILE) stop
+stop: env-example
+	$(DC) stop
 
-down:
-	$(COMPOSE) --env-file $(ENV_FILE) down
+down: env-example
+	$(DC) down
 
-restart:
-	$(COMPOSE) --env-file $(ENV_FILE) restart $(SERVICE)
+restart: env-example
+	$(DC) restart $(SERVICE)
 
-ps:
-	$(COMPOSE) --env-file $(ENV_FILE) ps
+ps: env-example
+	$(DC) ps
 
-logs:
-	$(COMPOSE) --env-file $(ENV_FILE) logs --tail=100 $(SERVICE)
+logs: env-example
+	$(DC) logs --tail=100 $(SERVICE)
 
-logs-follow:
-	$(COMPOSE) --env-file $(ENV_FILE) logs -f $(SERVICE)
+logs-follow: env-example
+	$(DC) logs -f $(SERVICE)
 
 mysql: wait-db
-	$(COMPOSE) --env-file $(ENV_FILE) exec $(SERVICE) sh -lc 'mysql -u"$$MYSQL_USER" -p"$$MYSQL_PASSWORD" "$$MYSQL_DATABASE"'
+	$(DC) exec $(SERVICE) sh -c 'MYSQL_PWD="$$MYSQL_PASSWORD" mysql -u"$$MYSQL_USER" "$$MYSQL_DATABASE"'
 
 mysql-root: wait-db
-	$(COMPOSE) --env-file $(ENV_FILE) exec $(SERVICE) sh -lc 'mysql -uroot -p"$$MYSQL_ROOT_PASSWORD" "$$MYSQL_DATABASE"'
+	$(DC) exec $(SERVICE) sh -c 'MYSQL_PWD="$$MYSQL_ROOT_PASSWORD" mysql -uroot "$$MYSQL_DATABASE"'
 
 load-players: wait-db
-	$(COMPOSE) --env-file $(ENV_FILE) exec -T $(SERVICE) sh -lc 'mysql -u"$$MYSQL_USER" -p"$$MYSQL_PASSWORD" "$$MYSQL_DATABASE" < /bootcamp/scripts/dimensional_data_modeling/players.sql'
+	$(call mysql_run,< $(SCRIPT_DIR)/players.sql)
 
 run-pipeline: wait-db
-	$(COMPOSE) --env-file $(ENV_FILE) exec -T $(SERVICE) sh -lc 'mysql -u"$$MYSQL_USER" -p"$$MYSQL_PASSWORD" "$$MYSQL_DATABASE" < /bootcamp/scripts/dimensional_data_modeling/pipeline_players.sql'
+	$(call mysql_run,< $(SCRIPT_DIR)/pipeline_players.sql)
 
 reload-players: load-players run-pipeline
 
 reset-db: env-example
-	$(COMPOSE) --env-file $(ENV_FILE) down -v
-	$(COMPOSE) --env-file $(ENV_FILE) up -d
+	$(DC) down -v
 	$(MAKE) wait-db
 
 python:
